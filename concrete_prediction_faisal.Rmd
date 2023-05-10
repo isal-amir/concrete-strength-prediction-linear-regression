@@ -1,0 +1,551 @@
+---
+title: "Capstone Concrete Prediction"
+author: "Faisal Amir Maz"
+date: "`r Sys.Date()`"
+output: 
+ html_document:
+   toc: true
+   toc_float: true
+   highlight: zenburn
+   df_print: paged
+   theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyverse)
+
+# Exploratory Data Analysis
+library(GGally)
+
+# Modeling and Evaluation
+library(randomForest)
+library(yardstick)
+library(lmtest)
+
+# Model Interpretation
+library(lime)
+
+# Set theme for visualization
+theme_set(theme_minimal())
+
+options(scipen = 999)
+```
+# EDA
+## Understanding Data
+```{r}
+concrete <- read.csv("data-train.csv")
+
+head(concrete)
+```
+
+```{r}
+glimpse(concrete)
+```
+The data type seems OK. No need to change the data type. The "flyash" column looks like all zero in glimpse(). We need to see it further.
+The data contains 10 columns and 825 rows.
+
+```{r}
+anyNA(concrete)
+```
+No NA values in dataset.
+
+```{r}
+sum(duplicated(concrete))
+```
+There's also no duplicated data.
+
+```{r}
+summary(concrete)
+```
+The "flyash" column is not all zero.
+
+```{r}
+concrete %>% select(-id) %>% boxplot()
+```
+The target variable contains outliers. The outliers seems not too far from the threshold line, so lets just left the outlier there for early development. Based on some literature, not every outliers harm the model. If the model not good enough we can try to delete the outliers on the future development.
+
+## Inspection on Correlation between Columns
+```{r}
+library(GGally)
+ggcorr(data = concrete, label = T, hjust = 1)
+```
+The highest correlation predictor column with the strength is "cement" column with correlation value 0.5.
+They are positively correlated. This is make sense because if we want to make a stronger concrete, we need more cement.
+
+```{r}
+plot(concrete$cement, concrete$strength)
+```
+
+## Cross-validation
+We'll make the proportion of training and testing 80:20. The process of deviding the data is done randomly. This is can be achieved by setting seed() value and using the sample() function.
+```{r}
+set.seed(123)
+df_row <- nrow(concrete)
+
+index <- sample(df_row, 0.8*df_row)
+
+data_train <- concrete[ index, ]
+data_test <- concrete[ -index, ]
+```
+
+```{r}
+data_train <- data_train %>% 
+  select(-id)
+head(data_train)
+```
+
+# Model Fitting
+The models that are being used:
+- linear model 
+- Random forest
+- Support vector machine regression
+
+
+## Linear Model
+```{r}
+model_linear <- lm(strength ~ . , data = data_train)
+
+summary(model_linear)
+```
+
+```{r}
+model_step <- step(model_linear, direction = "both", trace = 0)
+
+summary(model_step)
+```
+The adjusted R-squared is 0.61 means the model seems good. 
+
+To know the real performance of the model, we need a test with new data. Below is the function to measure the performance of model using the calculation of RMSE, MAE, MSE, and R-Square. MAE and R-Squared are used as the main measurement with threshold:
+- MAE < 4
+- R-Squared > 90
+
+### Function for evaluating model
+```{r}
+eval_recap <- function(truth, estimate){
+  
+  df_new <- data.frame(truth = truth,
+                       estimate = estimate)
+  
+  data.frame(RMSE = rmse_vec(truth, estimate),
+             MAE = mae_vec(truth, estimate),
+             "R-Square" = rsq_vec(truth, estimate),
+             check.names = F
+             ) %>% 
+    mutate(MSE = sqrt(RMSE))
+}
+```
+
+### Evaluating Model
+```{r}
+pred_test <- predict(model_step, data_test)
+
+eval_recap(truth = data_test$strength,
+           estimate = pred_test)
+```
+
+### Residuals Normality
+We use this test method to see whether the errors (residuals) form a normal distributionor not.
+```{r}
+shapiro.test(model_step$residuals)
+```
+
+### Durbin Watson Test
+The Durbin Watson statistic is a test statistic used in statistics to detect autocorrelation in the residuals from a regression analysis.
+H0 = no first order autocorrelation. (p-value > 0.05)
+H1 = first order correlation exists. (p-value < 0.05)
+
+```{r}
+library(lmtest)
+dwtest(model_step)
+```
+From the p-value above, we can conclude that there is no first order autocorrelation on the model.
+
+### Homoscedasticity
+Homoscesdasticity means that the variance of the random variables are constant. We can use the Breusch-Pagan test to check the homoscesdasticity of the model.
+H0 (p-value>0.05) = constant variance (Homoscedasticity)
+H1 (p-value<0.05) = non-constant variance (Heteroscedasticity)
+```{r}
+bptest(model_step)
+```
+The variance of the error random variable aren't constant
+
+### Multicollinearity
+The multicollinearity will look for a high correlation between predictors. Multicollinearity exist when the VIF > 10 or Tolerance < 0.01.
+```{r}
+rms::vif(model_step)
+```
+It seems that there is no multicollinearity between columns.
+
+Then we will move to the next model.
+
+## Random Forest
+Random Forest Regression is a supervised learning algorithm that uses ensemble learning method for regression. Ensemble learning method is a technique that combines predictions from multiple machine learning algorithms to make a more accurate prediction than a single model. Random Forest operates by constructing several decision trees during training time and outputting the mean of the classes as the prediction of all the trees.
+```{r}
+set.seed(123)
+model_rf <- randomForest(x = data_train %>% select(-strength),
+                         y = data_train$strength, 
+                         ntree = 500,
+                         mtry = 3)
+
+model_rf
+```
+
+### Model Evaluation
+```{r}
+pred_test <- predict(model_rf, data_test, type = "response")
+
+eval_recap(truth = data_test$strength,
+           estimate = pred_test)
+```
+Random Forest Model has better performance than lm linear model. This can be seen from the test measurement above. 
+
+## Model Support Vector Regression
+Support Vector Regression is a supervised learning algorithm that is used to predict discrete values. Support Vector Regression uses the same principle as the SVMs. The basic idea behind SVR is to find the best fit line. In SVR, the best fit line is the hyperplane that has the maximum number of points.
+```{r}
+library(e1071)
+
+model_svr <- svm(strength ~ ., data = data_train)
+
+pred_test <- predict(model_svr, data_test)
+
+eval_recap(truth = data_test$strength,
+           estimate = pred_test)
+```
+SVR model has better performance than lm linear model, but still under the performance of Random Forest model.
+
+# Model Improvement
+Improving models can be done through some ways. We can improve the data preprocess and also tune the model parameters.
+
+## Improvement on Data Preprocess
+Bad data handling can make a modelling harder and can resulting on a bad model. Outliers handling is one of example on better data preprocess. Outliers can result bias on our model.
+To see outliers in our data, we can use boxplot.
+```{r}
+concrete %>% select(-id) %>% boxplot()
+```
+There are many outliers exist. But because the most harmful outliers is in the target column. We need to inspect more on this.
+
+```{r}
+library(ggplot2)
+# Building histogram
+ggplot(data=concrete, aes(concrete$strength)) +
+  geom_histogram(aes(y =after_stat(density)), fill = "orange") +
+  geom_density()
+```
+From the graph above, we can see that column 'strength' is right-skewed. From the boxplot we can also see the outliers on around maximum value.
+
+### Removing Outliers
+
+```{r}
+Q1 <- quantile(concrete$strength, .25)
+Q3 <- quantile(concrete$strength, .75)
+IQR <- IQR(concrete$strength)
+```
+
+```{r}
+no_outliers <- subset(concrete, concrete$strength > (Q1 - 1.5*IQR) & concrete$strength < (Q3 + 1.5*IQR))
+dim(no_outliers)
+dim(concrete)
+```
+
+```{r}
+no_outliers$strength %>% boxplot()
+```
+
+
+### Split Data
+```{r}
+set.seed(123)
+df_row <- nrow(no_outliers)
+
+index <- sample(df_row, 0.8*df_row)
+
+no_outliers <- no_outliers %>% select(-id)
+
+data_train.no <- no_outliers[ index, ]
+data_test.no <- no_outliers[ -index, ]
+
+head(data_train.no)
+```
+
+
+
+### Model lm
+```{r}
+model_linear.no <- lm(strength ~ . , data = data_train.no)
+
+summary(model_linear.no)
+```
+
+```{r}
+model_step.no <- step(model_linear.no, direction = "both", trace = 0)
+
+summary(model_step.no)
+```
+This model has a slight better R-squared value than the model that's still having outliers.
+
+Test
+```{r}
+pred_test <- predict(model_step.no, data_test.no, type = "response")
+
+eval_recap(truth = data_test.no$strength,
+           estimate = pred_test)
+```
+
+
+
+### Model Random Forest + Parameter Tunning
+The tunning that we can do are:
+- improve the ntree
+- include importance parameter
+- improve by giving mtry parameter
+```{r}
+set.seed(123)
+model_rf_no <- randomForest(x = data_train.no %>% select(-strength),
+                         y = data_train.no$strength, 
+                         ntree = 1000, 
+                         importance = T, 
+                         mtry = 4)
+
+
+# Test
+pred_test <- predict(model_rf_no, data_test.no, type = "response")
+
+eval_recap(truth = data_test.no$strength,
+           estimate = pred_test)
+```
+By doing a better data prepocess (by removing outliers) and tunning the parameter, this model has a better performance. We can see that it has MAE 3.73 and R-Squared 0.917. 
+
+### Support Vector Regresssion + Parameter Tunning
+
+```{r}
+model_svr_no <- svm(strength ~ .,
+                    data = data_train.no,
+                    cost = 10)
+
+# Test
+pred_test <- predict(model_svr_no, data_test.no)
+
+eval_recap(truth = data_test.no$strength,
+           estimate = pred_test)
+```
+This model also has a better performance than the SVR model without improvement in data preprocess and parameter tunning. This model has a slight lower performance than the Random Forest model.
+
+
+# Model Interpretation
+For the Random Forest model, we can find the importance of the variables. We can do it by using $importance. The importances are calculated using the Gini index.
+```{r}
+model_rf_no$importance %>% 
+  as.data.frame() %>% 
+  arrange(-IncNodePurity) %>% 
+  rownames_to_column("variable") %>% 
+  head(10) %>% 
+  ggplot(aes(IncNodePurity, 
+             reorder(variable, IncNodePurity))
+         ) +
+  geom_col(fill = "firebrick") +
+  labs(x = "Importance",
+       y = NULL,
+       title = "Random Forest Variable Importance")
+```
+From the graph above, we can see the importance scores on every predictor. Age has the biggest importance score.
+The importance scores does help to understand the significant of a predictor. However, it doesn't give information about average direction that a variable affects on target value. We also can’t know specifically the influence of each factors for a single observation (no local-fidelity).
+Thus, we need a better method to interpret the model. LIME is a good method to do it.
+
+## LIME - Explainer
+
+Explainer will be used as foundation to interpret the blacbox model.
+```{r}
+set.seed(123)
+explainer <- lime(x = data_train.no %>% select(-strength), 
+                  model = model_rf_no)
+```
+
+
+## LIME - Explaination
+The explaination will uncover the explanation of specific observation we need. In this part we will see the explanation on 4 fist row (observation).
+```{r error=T}
+# Select only the first 4 observations
+selected_data <- data_test.no %>% 
+  #select(-id) %>% 
+  select(-strength) %>% 
+  slice(1:4)
+
+# Explain the model
+set.seed(123)
+explanation <- explain(x = selected_data, 
+                       explainer = explainer, 
+                       feature_select = "auto", # Method of feature selection for lime
+                       n_features = 8 # Number of features to explain the model
+                       )
+```
+
+```{r}
+class(model_rf)
+```
+
+```{r}
+model_type.randomForest <- function(x){
+  return("regression") # for regression problem
+}
+```
+
+```{r}
+predict_model.randomForest <- function(x, newdata, type = "response") {
+
+    # return prediction value
+    predict(x, newdata) %>% as.data.frame()
+    
+}
+```
+
+
+This part below will give the plot of explanation for 4 first observation. The "n_fearures" used to decide how many predictor will be showed in explanation. It will chose first "n" most significant predictor role to the target. In this part we will see the role of all 8 predictors so we'll set n_feature = 8.
+```{r}
+set.seed(123)
+explanation <- explain(x = selected_data, 
+                       explainer = explainer, 
+                       dist_fun = "euclidean",
+                       kernel_width = 0.2,
+                       n_features = 8, # Number of features to explain the model
+                       feature_select = "auto", # Method of feature selection for lime
+                       )
+
+plot_features(explanation)
+```
+Real value:
+```{r}
+head(data_test.no$strength,4)
+```
+Based on explanation of every case, case 2 has the most reliable explanation because has the explanation fit: 99%. On case 1 and 3 is still not really trustworthy because has explanation fit under 90%. Case 4 has the least trustworthiness because has a very low explanation fit value. 
+On case 2 we can see that age has positif effect on strength value because of age<56, and the other 7 predictor has negative effect to the stregth value. Age is the most important factor on observation 2. Flyash is the least important factor in observation 2 because has value less than 118.
+
+
+## LIME SVR
+```{r}
+set.seed(123)
+explainer <- lime(x = data_train.no %>% select(-strength), 
+                  model = model_svr_no)
+```
+
+```{r}
+class(model_svr)
+```
+
+```{r}
+model_type.svm <- function(x){
+  return("regression") # for regression problem
+}
+
+predict_model.svm <- function(x, newdata, type = "response") {
+
+    # return prediction value
+    predict(x, newdata) %>% as.data.frame()
+    
+}
+```
+
+```{r}
+set.seed(123)
+explanation <- explain(x = selected_data, 
+                       explainer = explainer, 
+                       dist_fun = "manhattan",
+                       kernel_width = 0.4,
+                       n_features =  8,# Number of features to explain the model
+                       feature_select = "auto", # Method of feature selection for lime
+                       )
+
+plot_features(explanation)
+```
+Real value:
+```{r}
+head(data_test.no$strength,4)
+```
+
+Case 1 and 2 have explanation fit > 95%. This indicates that the explanation on case 1 and 2 are reliable. In case 1, seven of eight predictors give positif effect towards strength value. Only fine_agg has negative effect because fine_agg $<=$ 734. Cement is the most important factor because it has value less than 349. This is make sense because cement has highest correlation to concrete strength. Fine_agg is the least important factor.
+In case 2, water is the most important factor for strength value because it has value less than 192. slag is the least important factor because it has value between 22 and 143.
+
+
+# Conclusion
+From this research we can conclude:
+- The goal to make a model that can predict the strength value of a concrete based on its material is achieved. This is because the model has a good performance (MAE and R-squared passed the threshold)
+- The models that passed the threshold are Random Forest Regression Model and Support Vector Regression Model. Random Forest has the highest score.
+- The method can be implemented in many business scope such as price predictions.
+
+
+
+
+
+# Addition: try to normalize data
+I've tried to scale (normalze) the data, but because it didn't bring a better model I decided not to use it. Here are the results:
+```{r}
+normalize <- function(x){
+  return((x-min(x))/(max(x)-min(x)))
+}
+```
+
+```{r}
+concrete_noid <- concrete %>% 
+  select(-id) %>% 
+  select(-strength)
+concrete_predictor_norm <- as.data.frame(lapply(concrete_noid,normalize))
+
+head(concrete_predictor_norm)
+```
+
+```{r}
+concrete_norm <- concrete_predictor_norm %>% mutate(strength = concrete$strength)
+```
+
+```{r}
+# we need to store the min and max values in case we want to convert back to real values.
+minvec <- sapply(concrete_noid,min) #bkn di data train karena nanti max min nya bisa jadi ga imbang di train test
+maxvec <- sapply(concrete_noid,max)
+
+```
+
+```{r}
+set.seed(123)
+df_row <- nrow(concrete)
+
+index <- sample(df_row, 0.8*df_row)
+
+data_train_norm <- concrete_norm[ index, ]
+data_test_norm <- concrete_norm[ -index, ]
+```
+
+
+```{r}
+model_linear_norm <- lm(strength ~ . , data = data_train_norm)
+
+summary(model_linear_norm)
+```
+
+```{r}
+model_step1 <- step(model_linear_norm, direction = "both", trace = 0)
+
+summary(model_step1)
+```
+
+
+```{r}
+set.seed(123)
+model_rf <- randomForest(x = data_train_norm %>% select(-strength),
+                         y = data_train_norm$strength, 
+                         ntree = 1000)
+
+model_rf
+```
+
+```{r}
+pred_test <- predict(model_rf, data_test_norm, type = "response")
+
+eval_recap(truth = data_test_norm$strength,
+           estimate = pred_test)
+```
+The result is not even better than the model without normalization on data.
